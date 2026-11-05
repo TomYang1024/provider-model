@@ -1,0 +1,30 @@
+# PROVIDER_SDK_CONFIG_FILE=/etc/provider-sdk/providers.toml
+# 覆盖内置默认配置。这里禁止写入密钥（请使用环境变量或 *_FILE）。
+
+[logging]
+mode = "metadata_only"   # 可选：metadata_only | redacted | full
+sample_rate = 1.0
+
+[providers.deepseek]
+strict_models = true     # 拒绝下方未列出的模型 ID
+max_retries = 2
+[providers.deepseek.timeouts]
+connect = 5
+read = 120
+total = 120
+
+# Qwen 改用国际站，并限制可传入的厂商参数
+[providers.qwen]
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+allowed_options = ["enable_search"]
+[providers.qwen.models."qwen3-max"]
+tools = true
+verification = "tested"
+
+# 新增一个 OpenAI 兼容 Provider：无需修改任何 SDK 代码
+[providers.internal-vllm]
+adapter = "openai_compatible"
+base_url = "http://vllm.internal:8000/v1"
+api_key_env = "INTERNAL_VLLM_KEY"
+otel_provider_name = "vllm"
+stream_usage_option = true

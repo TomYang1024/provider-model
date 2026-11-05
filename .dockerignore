@@ -1,0 +1,9 @@
+# 白名单方式：只把镜像构建需要的文件发送给 Docker 守护进程（绝不包含 .env 和 secrets/）
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!provider_sdk/
+!provider_gateway/
+**/__pycache__
+**/*.pyc

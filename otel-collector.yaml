@@ -1,0 +1,69 @@
+# 网关编排使用的 OpenTelemetry Collector（contrib 0.128.0）配置。
+#
+# 流量只在 Docker 内部网络中传输，因此这里使用明文 OTLP。
+# 跨不可信网络时，需要在 Receiver 上启用 TLS（和认证），并在网关上设置
+# OTEL_EXPORTER_OTLP_ENDPOINT=https://... / OTEL_EXPORTER_OTLP_CERTIFICATE，
+# 详见 docs/deployment.md。
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 8
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 高负载时保护 Collector 自身：超过内存限制时丢弃数据，而不是 OOM
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  # 纵深防御：SDK 本身不会记录这些请求头，这里再兜底删除一次
+  attributes/scrub:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.request.header.x-api-key
+        action: delete
+  # 批量发送，降低导出请求数
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+    # 发送队列 + 有限时间重试：Jaeger 短暂不可用时不丢数据
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 60s
+  # Jaeger 只存储 Trace；指标在这里以摘要形式输出到日志。
+  # 生产环境可替换为 prometheus / otlp 导出器，发送到指标后端。
+  debug:
+    verbosity: basic
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/scrub, batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+  telemetry:
+    logs:
+      level: info

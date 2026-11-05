@@ -1,0 +1,29 @@
+# 容器测试使用的覆盖配置：用假 Provider 代替真实 API，无需密钥和外网。
+#   docker compose -f compose.yaml -f tests/container/compose.test.yaml up -d --build --wait
+services:
+  fake-provider:
+    image: provider-gateway:1.0.0  # 复用网关镜像中已安装的 uvicorn / starlette
+    command: ["python", "/opt/fake/fake_provider.py", "--host", "0.0.0.0", "--port", "8081"]
+    volumes:
+      - ./tests/e2e/fake_provider.py:/opt/fake/fake_provider.py:ro
+    environment:
+      CHUNK_DELAY: "0.2"
+      CHUNKS: "100"
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8081), 2)"]
+      interval: 2s
+      retries: 15
+
+  provider-gateway:
+    environment:
+      DEEPSEEK_API_KEY: sk-container-test-0000000000
+      DEEPSEEK_BASE_URL: http://fake-provider:8081
+      GATEWAY_API_KEYS: container-test-token
+      OTEL_TRACES_SAMPLER: always_on
+      GATEWAY_SHUTDOWN_GRACE_SECONDS: "2"
+      GATEWAY_TELEMETRY_FLUSH_TIMEOUT: "3"
+      PROVIDER_SDK_TRUST_ENV: "false"
+    depends_on:
+      fake-provider:
+        condition: service_healthy

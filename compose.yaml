@@ -1,0 +1,112 @@
+# Provider Gateway + OpenTelemetry Collector + Jaeger。
+#
+#   cp .env.example .env    # 填写密钥
+#   docker compose up -d --build
+#
+# 暴露范围：网关默认绑定 127.0.0.1:8080（通过 GATEWAY_BIND 修改）。Collector 和
+# Jaeger 不暴露公网端口；Jaeger UI 只绑定 127.0.0.1。使用 Docker Secrets 管理密钥时
+# 追加 -f compose.secrets.yaml。
+name: provider-gateway
+
+# 日志轮转：每个容器最多保留 5 个 10MB 的日志文件
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# 容器加固：只读根文件系统、移除所有 Linux capability、禁止提权
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  provider-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: provider-gateway:1.0.0
+    init: true  # 使用 tini 作为 PID 1，负责转发信号和回收僵尸进程
+    <<: *hardening
+    tmpfs:
+      - /tmp:size=64m
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      OTEL_SERVICE_NAME: provider-gateway
+      # 容器之间通过服务名通信，绝不使用 localhost
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=${DEPLOY_ENV:-production}
+      GATEWAY_SHUTDOWN_GRACE_SECONDS: ${GATEWAY_SHUTDOWN_GRACE_SECONDS:-20}
+      GATEWAY_TELEMETRY_FLUSH_TIMEOUT: ${GATEWAY_TELEMETRY_FLUSH_TIMEOUT:-5}
+    ports:
+      - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PUBLISHED_PORT:-8080}:8080"
+    networks: [edge, telemetry]
+    depends_on:
+      otel-collector:
+        condition: service_started
+        # Collector 不可用时网关依然启动并提供服务
+        required: false
+    # Compose 健康检查使用 readiness：初始化完成且未在停机时才视为健康
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request as u; sys.exit(0 if u.urlopen('http://127.0.0.1:8080/health/ready', timeout=2).status == 200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    # 必须 > GATEWAY_SHUTDOWN_GRACE_SECONDS + GATEWAY_TELEMETRY_FLUSH_TIMEOUT + 余量，
+    # 否则 Docker 会在优雅停机完成前发送 SIGKILL
+    stop_grace_period: 35s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1g
+    logging: *default-logging
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    <<: *hardening
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    networks: [telemetry]
+    # 不发布任何端口：只能在内部 telemetry 网络中访问。
+    # （distroless 镜像中没有 shell，无法配置 HEALTHCHECK；健康检查扩展监听 :13133）
+    restart: unless-stopped
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m
+    logging: *default-logging
+
+  jaeger:
+    image: jaegertracing/jaeger:2.7.0
+    networks: [telemetry, jaeger-ui]
+    ports:
+      - "127.0.0.1:${JAEGER_UI_PORT:-16686}:16686"
+    restart: unless-stopped
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1g
+    logging: *default-logging
+
+networks:
+  # 网关入口流量 + 访问 Provider API 的出口流量（HTTPS）
+  edge: {}
+  # 仅用于遥测数据，没有通往外部网络的路由
+  telemetry:
+    internal: true
+  # 仅用于在本机发布 Jaeger UI
+  jaeger-ui: {}

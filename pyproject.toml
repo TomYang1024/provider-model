@@ -1,0 +1,97 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "provider-sdk"
+version = "1.0.0"
+description = "Production multi-provider LLM SDK (DeepSeek, GLM, Kimi, Qwen) with OpenTelemetry and structlog, plus an optional FastAPI gateway."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Framework :: AsyncIO",
+  "Typing :: Typed",
+]
+# Core SDK: no FastAPI, no OpenTelemetry *SDK* (only the API).
+# Ranges are bounded below a breaking major/minor; exact versions are locked in uv.lock.
+dependencies = [
+  "openai>=3.46,<4",
+  "httpx2>=2.16,<3",          # transport used by openai>=3
+  "pydantic>=2.14,<3",
+  "structlog>=26.1,<27",
+  "opentelemetry-api>=1.45,<2",
+]
+
+[project.optional-dependencies]
+# OpenTelemetry SDK + OTLP exporter for applications that want the bootstrap helper.
+otel = [
+  "opentelemetry-sdk>=1.45.2,<1.46",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.45.2,<1.46",
+]
+# FastAPI HTTP/SSE gateway (separate package `provider_gateway`).
+gateway = [
+  "provider-sdk[otel]",
+  "fastapi>=0.162,<0.163",
+  "uvicorn>=0.54,<0.55",
+  "pydantic-settings>=2.16,<3",
+]
+
+[project.scripts]
+provider-gateway = "provider_gateway.__main__:main"
+
+[dependency-groups]
+dev = [
+  "provider-sdk[gateway]",
+  "pytest>=9.2,<10",
+  "pytest-asyncio>=1.4,<2",
+  "ruff>=0.17,<0.18",
+  "mypy>=2.4,<3",
+  "opentelemetry-semantic-conventions>=0.66b2,<0.67",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["provider_sdk", "provider_gateway"]
+
+[tool.hatch.build.targets.sdist]
+include = ["provider_sdk", "provider_gateway", "README.md", "pyproject.toml"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not integration and not container'"
+markers = [
+  "integration: calls real provider APIs (needs API keys; run with -m integration)",
+  "container: builds and runs the Docker Compose stack (run with -m container)",
+]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S", "SIM", "RUF", "A", "PT"]
+ignore = ["S101", "RUF012", "S311", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ASYNC", "B017", "PT011", "PT012", "PT018", "RUF001", "E501", "A002"]
+"examples/**" = ["S", "RUF001"]
+"provider_sdk/observability/semconv.py" = ["S105"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = false
+packages = ["provider_sdk", "provider_gateway"]
+
+[[tool.mypy.overrides]]
+module = ["opentelemetry.sdk.*", "opentelemetry.exporter.*"]
+ignore_missing_imports = true
