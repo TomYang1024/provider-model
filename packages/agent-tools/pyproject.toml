@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-tools"
+version = "0.1.0"
+description = "Agent tool calling infrastructure: tool definition, discovery, execution and governance, decoupled from provider SDKs and agent runtimes."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Framework :: AsyncIO",
+  "Typing :: Typed",
+]
+# 核心依赖：与 provider-sdk 的取值范围保持一致，避免在同一个 workspace 中冲突。
+# 不依赖 provider-sdk、openai、httpx2：只用工具包的宿主不会被迫安装它们。
+dependencies = [
+  "pydantic>=2.14,<3",
+  "opentelemetry-api>=1.45,<2",
+  "structlog>=26.1,<27",
+]
+
+[project.optional-dependencies]
+# HTTP 工具适配器与 JSON Schema 校验：agent_tools.adapters.http / agent_tools.security.schema
+http = ["httpx2>=2.16,<3", "jsonschema>=4.20,<5"]
+# MCP Client 工具适配：agent_tools.adapters.mcp（官方 SDK，锁定到次版本，2.x 仍在快速变化）
+mcp = ["mcp>=2.3,<2.4", "jsonschema>=4.20,<5"]
+# Provider SDK 桥接：agent_tools.integrations.provider_sdk
+provider-sdk = ["provider-sdk>=1.0,<2"]
+
+[dependency-groups]
+dev = [
+  "agent-tools[http,mcp,provider-sdk]",
+  "opentelemetry-sdk>=1.45.2,<1.46",
+  "opentelemetry-semantic-conventions>=0.66b2,<0.67",
+  "pytest>=9.2,<10",
+  "pytest-asyncio>=1.4,<2",
+  "ruff>=0.17,<0.18",
+  "mypy>=2.4,<3",
+]
+
+[tool.uv.sources]
+provider-sdk = { workspace = true }
+agent-tools = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_tools"]
+
+[tool.hatch.build.targets.sdist]
+include = ["agent_tools", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+# importlib 模式：避免与仓库根目录的 tests 包同名冲突
+addopts = "-ra --strict-markers --import-mode=importlib -m 'not packaging and not network and not redis'"
+markers = [
+  "packaging: builds the wheel and installs it into a temporary venv (run with -m packaging)",
+  "network: real loopback TCP/TLS servers (run with -m network; needs permission to bind 127.0.0.1)",
+  "redis: runs the Lua scripts of the reference distributed rate limiter on a real Redis (run with -m redis; needs AGENT_TOOLS_REDIS_URL and the redis package)",
+]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ASYNC", "B017", "PT011", "PT012", "PT018", "RUF001", "E501", "A002"]
+"examples/**" = ["S", "RUF001"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = false
+packages = ["agent_tools"]
+
+[[tool.mypy.overrides]]
+# jsonschema 没有内置类型信息；不为此新增 types-jsonschema 依赖
+module = ["opentelemetry.sdk.*", "opentelemetry.exporter.*", "jsonschema", "jsonschema.*"]
+ignore_missing_imports = true

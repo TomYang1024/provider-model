@@ -68,6 +68,75 @@ asyncio.run(main())
 
 更多示例见 [`examples/`](examples)：工具调用循环、流式输出、Telemetry 初始化、网关客户端、TOML 配置。
 
+## Agent 工具调用示例
+
+仓库内的 [`agent-tools`](packages/agent-tools/README.md) 是独立的工具调用基础设施，负责工具的
+注册、路由、执行和治理。下面的 `agent_loop.py` 将 Provider SDK 与工具执行器连接起来，演示
+“模型请求工具 → 执行工具 → 结果回填 → 模型回答”。
+
+以下命令在仓库根目录运行。首次使用请先执行 `uv sync`；示例依赖 OpenTelemetry SDK，MCP 演示
+还需要 MCP 可选依赖，这些依赖包含在本仓库默认开发环境中。
+
+### 模拟模型：无需 API Key
+
+```bash
+uv run python packages/agent-tools/examples/agent_loop.py --verbose
+```
+
+默认使用预设的模拟模型响应，执行 Python 天气和记事工具，用于检查调用链和日志。天气数据是
+模拟的；记事工具不会实际保存数据。
+
+### 真实模型调用 Python 工具
+
+先在当前终端设置 `DEEPSEEK_API_KEY`，然后运行：
+
+```bash
+uv run python packages/agent-tools/examples/agent_loop.py --real --verbose
+```
+
+默认使用 `deepseek` / `deepseek-flash`。可通过 `--provider`、`--model` 和 `--prompt` 指定
+服务商、模型和请求内容；模型需存在于 SDK 的配置中，且账户有调用权限：
+
+```bash
+uv run python packages/agent-tools/examples/agent_loop.py \
+  --real --verbose --provider deepseek --model deepseek-flash \
+  --prompt "北京和上海今天天气怎么样？"
+```
+
+`--real` 只表示调用真实模型；示例中的天气和记事工具仍是模拟实现。真实模型请求可能产生费用。
+API Key 应通过环境变量或项目支持的密钥文件提供，不要写进代码或提交到版本控制。
+
+### 真实模型调用本地 MCP 工具
+
+配置 `DEEPSEEK_API_KEY` 后运行：
+
+```bash
+uv run python packages/agent-tools/examples/agent_loop.py \
+  --real --mcp-demo --verbose \
+  --prompt "请调用 MCP 回显工具，处理文本：你好，Agent"
+```
+
+`--mcp-demo` 启动本地 stdio MCP 回显服务，将 `echo` 加入工具白名单，并在运行结束时关闭服务。
+日志中的 `kind=mcp` 和 `status=success` 表示对应 MCP 工具调用成功；是否调用工具由模型决定。
+这是本地演示服务，不连接业务 MCP 服务端。当前 `echo` 工具会在输入文本前后添加 `echo` 和
+`123`。不加 `--real` 可用模拟模型验证同一条 MCP 调用链，
+无需 API Key：
+
+```bash
+uv run python packages/agent-tools/examples/agent_loop.py --mcp-demo --verbose
+```
+
+### 会话、追踪与日志
+
+示例每次运行自动生成 `session_id`，也可用 `--session-id my-session-001` 指定。一次运行内模型
+调用和工具调用共享 `trace_id`，每次操作有各自的 `span_id`。示例中的 Trace 用于关联日志，
+不会自动导出或持久化；接入追踪平台需要由宿主配置 OpenTelemetry 导出器。
+
+`--verbose` 显示每轮调用、工具参数预览和结果摘要。参数预览经过规则脱敏，但不能保证识别所有
+敏感内容，使用共享终端时请避免输入敏感信息。
+
+更多工具配置、HTTP / MCP 接入和测试方法见 [`agent-tools` 文档](packages/agent-tools/README.md)。
+
 ### 流式事件协议
 
 ```

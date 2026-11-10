@@ -51,6 +51,8 @@ dev = [
   "ruff>=0.17,<0.18",
   "mypy>=2.4,<3",
   "opentelemetry-semantic-conventions>=0.66b2,<0.67",
+  # 工具调用基础设施（独立的 workspace 子项目，见 packages/agent-tools）
+  "agent-tools[http,mcp,provider-sdk]",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -61,6 +63,12 @@ include = ["provider_sdk", "provider_gateway", "README.md", "pyproject.toml"]
 
 [tool.uv]
 default-groups = ["dev"]
+
+[tool.uv.workspace]
+members = ["packages/agent-tools"]
+
+[tool.uv.sources]
+agent-tools = { workspace = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
