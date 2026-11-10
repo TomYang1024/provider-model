@@ -10,3 +10,6 @@ dist/
 build/
 *.egg-info/
 .idea/
+
+# Keep Markdown files under docs/ local only.
+/docs/**/*.md
