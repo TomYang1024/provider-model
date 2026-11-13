@@ -7,11 +7,13 @@ HTTP/SSE 网关及 Docker 部署方案。
 ```
 应用 / Agent ──► provider_sdk（Python 库）              ┐
 其他语言服务 ──► provider_gateway（HTTP/SSE）──────────► │ ProviderSDK ─► 请求校验 ─► 可观测性中间件
-                                                         │   ─► Provider 注册表 ─► OpenAI 兼容适配器
-                                                         ┘      ├─ DeepSeek  ├─ GLM  ├─ Kimi  └─ Qwen
+                                                         │   ─► Provider 注册表 ─► 适配器 ─► LiteLLM
+                                                         ┘      ├─ DeepSeek  ├─ GLM  ├─ Kimi  ├─ Qwen
+                                                                └─ litellm（Anthropic / Gemini / Bedrock …）
 ```
 
-* 统一接口：`chat()`、`messages()`、`stream()` / `open_stream()`。
+* 统一接口：`chat()`、`messages()`、`stream()` / `open_stream()`；三个入口在适配器层汇聚为
+  同一条调用路径，统一经由 [LiteLLM](https://docs.litellm.ai) 发起请求。
 * 支持 Tool Calling（SDK 只负责协议，**不执行**工具）、Reasoning、带来源标记的 Token Usage
   （`provider` / `estimated` / `unknown`）、多模态 ContentPart。
 * 统一异常体系：带 `retryable`、安全错误摘要，并保留异常链。
@@ -24,13 +26,14 @@ HTTP/SSE 网关及 Docker 部署方案。
 
 ```bash
 uv sync                                  # 开发环境（Python 3.11+）
-pip install provider-sdk                 # 仅 SDK：openai、httpx2、pydantic、structlog、otel-api
+pip install provider-sdk                 # 仅 SDK：litellm、openai、httpx2、pydantic、structlog、otel-api
 pip install "provider-sdk[otel]"         # 追加 OpenTelemetry SDK / OTLP 导出器初始化工具
 pip install "provider-sdk[gateway]"      # 追加 FastAPI 网关
 ```
 
 精确版本锁定在 `uv.lock`，`pyproject.toml` 中只声明有上界的兼容范围。
 注意：`openai>=3` 底层使用 **`httpx2`**（而非 `httpx`），因此 SDK 的传输层直接基于 `httpx2`。
+`litellm` 内部接口变化频繁，版本锁定在单个 minor 内；升级后请运行 `make test`。
 
 ## 快速开始
 
@@ -170,8 +173,39 @@ message_start ( reasoning_delta | text_delta | tool_call_start tool_call_delta* 
 | `PROVIDER_SDK_ESTIMATE_USAGE` | Provider 未返回 Usage 时启用启发式估算（`source="estimated"`）。 |
 
 新增 Provider 无需修改 Client：注册一个 `ProviderConfig`（TOML 或 `sdk.registry.register(...)`），
-使用 `adapter="openai_compatible"`，或通过 `registry.register_adapter_type(...)` 注册自定义的
+按协议选择适配器类型，或通过 `registry.register_adapter_type(...)` 注册自定义的
 `BaseProviderAdapter` 子类。
+
+### LiteLLM 接入方式
+
+所有适配器都通过 `litellm.acompletion` 发起调用，分两条路由：
+
+| 适配器类型 | 适用 Provider | HTTP 由谁发出 | HTTP Span / 连接池 / 代理配置 |
+|---|---|---|---|
+| `deepseek` / `glm` / `kimi` / `qwen` / `openai_compatible` | OpenAI 兼容接口 | SDK 自己的 `httpx2` 客户端（注入 LiteLLM） | 全部生效 |
+| `litellm` | LiteLLM 支持的其他 Provider（Anthropic、Gemini、Bedrock、Azure …） | LiteLLM 原生实现 | 不生效（请求级 Span、指标、日志仍有） |
+
+```toml
+[providers.claude]
+adapter = "litellm"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+adapter_options = { litellm_provider = "anthropic" }
+```
+
+LiteLLM 的归一化层有几处与本 SDK 的约定不同，适配器已逐项处理，行为与接入前保持一致：
+
+* Provider 未返回 Usage 时，LiteLLM 会补零或本地估算 —— SDK 仍报告 `usage.source="unknown"`；
+* 未知的 `finish_reason` 会被 LiteLLM 改写为 `stop` —— SDK 按 Provider 原始值映射，
+  原始值保留在 `raw_finish_reason`；
+* 厂商异常会被重新包装 —— SDK 沿异常链取回原始异常，业务错误码分类规则不变；
+* LiteLLM 会把环境变量 `OPENAI_ORGANIZATION` 写入请求头、用 600 秒默认值覆盖超时、给流式请求
+  自动加上 `stream_options` —— SDK 均已阻止：不向第三方 Provider 泄露 OpenAI 标识，
+  超时与 `stream_usage_option` 以 `ProviderConfig` 为准；
+* `litellm` 在首个适配器创建时才导入（约 1~2 秒，一次性），导入时不联网。
+
+已知差异：Moonshot 旧版模型放在 `choices[0].usage` 中的流式 Usage 不再解析（记为 `unknown`）。
+`litellm` 适配器的请求级 `provider_options` 只有在配置了 `allowed_options` 白名单时才接受。
 
 ## Docker
 

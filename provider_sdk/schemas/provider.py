@@ -54,7 +54,7 @@ class ProviderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9_\-]{0,63}$")
-    #: 注册表中的适配器类型键（``deepseek``、``openai_compatible`` 等）。
+    #: 注册表中的适配器类型键（``deepseek``、``openai_compatible``、``litellm`` 等）。
     adapter: str
     enabled: bool = True
     api_key: SecretStr | None = None
@@ -90,7 +90,7 @@ class ProviderConfig(BaseModel):
     stream_usage_option: bool = True
     #: 是否在历史消息中把 assistant 的 ``reasoning_content`` 回传给 Provider。
     send_reasoning_content: bool = False
-    #: 适配器特有的自由选项。
+    #: 适配器特有的自由选项（``litellm`` 适配器：``litellm_provider`` 指定 LiteLLM 路由）。
     adapter_options: dict[str, Any] = Field(default_factory=dict)
 
     def capabilities_for(self, model: str) -> ModelCapabilities | None:

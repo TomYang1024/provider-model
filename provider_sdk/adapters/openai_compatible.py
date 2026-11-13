@@ -1,9 +1,23 @@
-"""OpenAI 兼容协议的通用适配器。
+"""OpenAI 兼容协议的通用适配器（统一经由 LiteLLM 调用）。
 
 DeepSeek / GLM / Kimi / Qwen 都提供 OpenAI 兼容的 Chat Completions 接口，
 本模块实现四者共用的部分：请求参数构建、响应归一化、流式事件转换、
 Tool Calling 组装、Usage 解析和异常映射。各 Provider 的差异通过子类覆盖
 ``apply_reasoning`` / ``classify_error`` 钩子以及 ``ProviderConfig`` 开关处理。
+
+调用链路：``chat()`` / ``messages()`` / ``stream()`` 三个入口最终都汇聚到
+:meth:`OpenAICompatibleAdapter._invoke`，由它调用 ``litellm.acompletion``。
+对 OpenAI 兼容的 Provider，我们把自己构建的 ``AsyncOpenAI`` 客户端注入 LiteLLM，
+因此连接池、代理解析、HTTP Span（:class:`TracingTransport`）和超时配置都保持不变。
+
+LiteLLM 的归一化层有几处与本 SDK 的约定不一致，本模块逐一做了处理：
+
+* 未返回 Usage 时 LiteLLM 会补零（非流式）或本地估算（流式）——这里一律识别并
+  还原为 ``unknown``，绝不把估算值当作 Provider 上报的数字；
+* 未知的 ``finish_reason`` 会被 LiteLLM 改写成 ``stop``——这里读取原始值再做映射；
+* 厂商异常会被重新包装（如连接失败变成 500）——这里沿异常链找回原始异常再分类；
+* LiteLLM 会把环境变量 ``OPENAI_ORGANIZATION`` 写到注入的客户端上——
+  :class:`_IsolatedAsyncOpenAI` 禁止了这一写入。
 """
 
 from __future__ import annotations
@@ -43,6 +57,7 @@ from ..schemas.stream import (
     UsageEvent,
 )
 from ..transport import TracingTransport, resolve_proxy
+from ._litellm import load_litellm
 from .base import BaseProviderAdapter
 
 # Provider 原始 finish_reason -> SDK 统一取值；未列出的值归为 "unknown"，
@@ -141,6 +156,44 @@ def _extra(obj: Any, key: str) -> Any:
     return getattr(obj, key, None)
 
 
+def _hidden(obj: Any, key: str) -> Any:
+    """读取 LiteLLM 响应对象 ``_hidden_params`` 中的元数据（不存在时返回 None）。"""
+    hidden = getattr(obj, "_hidden_params", None)
+    return hidden.get(key) if isinstance(hidden, dict) else None
+
+
+def _is_truncation(exc: BaseException) -> bool:
+    """是否为 LiteLLM 对“上游未发 finish_reason 就结束”的报错（只能按类名 + 文本识别）。"""
+    return type(
+        exc
+    ).__name__ == "MidStreamFallbackError" and "Stream ended before a finish_reason" in str(exc)
+
+
+class _IsolatedAsyncOpenAI(AsyncOpenAI):
+    """不携带任何 OpenAI 组织 / 项目标识的客户端。
+
+    openai SDK 会从环境变量读取 ``OPENAI_ORG_ID`` / ``OPENAI_PROJECT_ID``，LiteLLM 还会把
+    ``OPENAI_ORGANIZATION`` 写到传入的客户端上，并作为请求头发送。这些 OpenAI 的内部标识
+    绝不能泄露给第三方 Provider，因此两个属性恒为 ``None``，任何赋值都被忽略。
+    """
+
+    @property
+    def organization(self) -> str | None:  # type: ignore[override]
+        return None
+
+    @organization.setter
+    def organization(self, value: str | None) -> None:
+        pass
+
+    @property
+    def project(self) -> str | None:  # type: ignore[override]
+        return None
+
+    @project.setter
+    def project(self, value: str | None) -> None:
+        pass
+
+
 class OpenAICompatibleAdapter(BaseProviderAdapter):
     adapter_type: ClassVar[str] = "openai_compatible"
 
@@ -152,6 +205,13 @@ class OpenAICompatibleAdapter(BaseProviderAdapter):
         transport: httpx2.AsyncBaseTransport | None = None,
     ) -> None:
         super().__init__(config, tracer=tracer, transport=transport)
+        # 先完成配置校验和客户端构建，再加载 litellm：配置有误时无需付出导入开销
+        self._client = self._build_client(transport)
+        self._litellm = load_litellm()
+
+    def _build_client(self, transport: httpx2.AsyncBaseTransport | None) -> AsyncOpenAI | None:
+        """构建注入 LiteLLM 的 ``AsyncOpenAI`` 客户端（连接池 / 代理 / HTTP Span）。"""
+        config = self.config
         # 启用的 Provider 必须有密钥；绝不让 openai SDK 回退读取 OPENAI_API_KEY
         if config.api_key is None or not config.api_key.get_secret_value():
             raise ValueError(f"provider {config.name!r} is enabled but has no API key")
@@ -167,28 +227,45 @@ class OpenAICompatibleAdapter(BaseProviderAdapter):
             # 确保经过代理的请求同样会产生 HTTP Span。
             proxy = resolve_proxy(config.base_url, proxy=config.proxy, trust_env=config.trust_env)
             transport = httpx2.AsyncHTTPTransport(limits=limits, proxy=proxy)
-        self._http = httpx2.AsyncClient(
+        # LiteLLM 每次调用都会传入请求级 timeout（默认 600 秒）并覆盖客户端默认值，
+        # 因此保存下来，在 route_kwargs() 中随每次调用显式传递
+        self._timeout = httpx2.Timeout(connect=t.connect, read=t.read, write=t.write, pool=t.pool)
+        http = httpx2.AsyncClient(
             transport=TracingTransport(
-                transport, tracer=tracer, propagate_context=config.propagate_trace_context
+                transport, tracer=self.tracer, propagate_context=config.propagate_trace_context
             ),
-            timeout=httpx2.Timeout(connect=t.connect, read=t.read, write=t.write, pool=t.pool),
+            timeout=self._timeout,
             # 代理已在上面解析；若此处 trust_env=True，httpx2 会额外挂载代理传输层，
             # 这些请求将绕过 TracingTransport（丢失 Span 和连接池限制）。
             trust_env=False,
             follow_redirects=False,
         )
-        self._client = AsyncOpenAI(
+        return _IsolatedAsyncOpenAI(
             api_key=config.api_key.get_secret_value(),
             base_url=config.base_url,
             # openai SDK 内置重试只发生在拿到响应之前，次数有上限（≤5），不会无限重试
             max_retries=config.max_retries,
-            http_client=self._http,
+            http_client=http,
             default_headers=config.extra_headers or None,
         )
-        # openai SDK 会从环境变量读取 OPENAI_ORG_ID / OPENAI_PROJECT_ID 并作为请求头发送，
-        # 这些 OpenAI 的内部标识绝不能泄露给第三方 Provider，因此强制清空。
-        self._client.organization = None
-        self._client.project = None
+
+    def route_kwargs(self) -> dict[str, Any]:
+        """决定 LiteLLM 走哪条路由、使用哪个 HTTP 客户端的调用参数。
+
+        OpenAI 兼容路由：显式指定 ``custom_llm_provider="openai"``（模型 ID 原样透传，
+        不做 ``provider/model`` 前缀解析），并注入我们自己的客户端。
+        """
+        return {
+            "custom_llm_provider": "openai",
+            "client": self._client,
+            # 请求实际发往客户端自身的 base_url；这里传 api_base 是为了让 LiteLLM 知道对端
+            # 不是 OpenAI 官方接口，否则它会给所有流式请求自动加上 stream_options
+            # （是否发送必须由 ProviderConfig.stream_usage_option 决定）
+            "api_base": self.config.base_url,
+            # 与客户端保持一致；不传时 LiteLLM 会用自己的默认值改写客户端
+            "max_retries": self.config.max_retries,
+            "timeout": self._timeout,
+        }
 
     # ------------------------------------------------------------------------------
     # 请求构建
@@ -316,11 +393,19 @@ class OpenAICompatibleAdapter(BaseProviderAdapter):
             return "unknown"
         return _FINISH_REASONS.get(raw, "unknown")
 
+    def resolve_finish_reason(self, native: str | None, mapped: str | None) -> FinishReason:
+        """由 Provider 原始值 ``native`` 和 LiteLLM 映射后的值 ``mapped`` 得到统一取值。
+
+        LiteLLM 会把不认识的原始值改写成 ``stop``（例如 GLM 的 ``network_error``），
+        所以只要拿得到原始值，就只按原始值判断。
+        """
+        return self.normalize_finish_reason(native if native is not None else mapped)
+
     @staticmethod
     def parse_usage(usage: Any) -> TokenUsage | None:
         """解析 Usage；Provider 未返回 Token 数时返回 None（绝不伪造数字）。
 
-        同时兼容 openai 对象（非流式）和普通 dict（Kimi 旧版放在 choice 内的 usage）。
+        同时兼容 LiteLLM / openai 的 Usage 对象和普通 dict。
         """
         if usage is None:
             return None
@@ -396,21 +481,33 @@ class OpenAICompatibleAdapter(BaseProviderAdapter):
         content = msg.content
         if content is None and not tool_calls:
             content = ""
-        usage = self.parse_usage(getattr(completion, "usage", None)) or TokenUsage.unknown()
-        raw_finish = choice.finish_reason
+        usage = self.parse_usage(getattr(completion, "usage", None))
+        if usage is not None and not (
+            usage.input_tokens or usage.output_tokens or usage.total_tokens
+        ):
+            # Provider 未返回 usage 时 LiteLLM 会补一个全 0 的对象：视为未知，而不是 0 Token
+            usage = None
+        usage = usage or TokenUsage.unknown()
+        # LiteLLM 把 Provider 的原始 finish_reason 保留在 provider_specific_fields 中
+        mapped_finish = choice.finish_reason
+        native_finish = (getattr(choice, "provider_specific_fields", None) or {}).get(
+            "native_finish_reason"
+        )
+        raw_finish = native_finish or mapped_finish
         return ChatResponse(
             id=getattr(completion, "id", None),
             request_id=request.context.request_id,
             provider=self.name,
             model=request.model,
-            response_model=getattr(completion, "model", None),
+            response_model=_hidden(completion, "provider_response_model")
+            or getattr(completion, "model", None),
             message=Message(
                 role="assistant",
                 content=content,
                 tool_calls=tool_calls,
                 reasoning_content=reasoning,
             ),
-            finish_reason=self.normalize_finish_reason(raw_finish),
+            finish_reason=self.resolve_finish_reason(native_finish, mapped_finish),
             raw_finish_reason=raw_finish,
             usage=usage,
             provider_extensions=self.provider_extensions(completion),
@@ -419,35 +516,34 @@ class OpenAICompatibleAdapter(BaseProviderAdapter):
     # ------------------------------------------------------------------------------
     # 调用入口
     # ------------------------------------------------------------------------------
-    async def complete(self, request: ChatRequest) -> ChatResponse:
+    async def _invoke(self, request: ChatRequest) -> Any:
+        """所有模型调用的唯一出口：校验 → 构建参数 → ``litellm.acompletion``。
+
+        流式与非流式共用这一条路径，区别只在 ``params["stream"]``：非流式返回
+        ``ModelResponse``；流式在收到 HTTP 响应头后返回 ``CustomStreamWrapper``
+        （此时 Provider 已接受请求，4xx/5xx 在这里抛出，还没有产生任何流事件）。
+        """
         # 先做能力校验（无 I/O），不支持的能力在发请求前就失败
         caps = self.validate(request)
         params = self.build_params(request, caps)
         try:
-            completion = await self._client.chat.completions.create(**params)
+            return await self._litellm.acompletion(**params, **self.route_kwargs())
         except errors.ProviderError:
             raise
         except Exception as exc:
             # 厂商异常统一映射，原异常通过 from 保留在异常链中
             raise self.map_error(exc, request) from exc
-        return self.parse_response(request, completion)
+
+    async def complete(self, request: ChatRequest) -> ChatResponse:
+        return self.parse_response(request, await self._invoke(request))
 
     async def open_stream(self, request: ChatRequest) -> OpenAICompatibleStream:
-        caps = self.validate(request)
-        params = self.build_params(request, caps)
-        try:
-            # create() 在收到 HTTP 响应头后返回：此时 Provider 已接受请求，
-            # 4xx/5xx 等错误在这里抛出，还没有产生任何流事件
-            raw = await self._client.chat.completions.create(**params)
-        except errors.ProviderError:
-            raise
-        except Exception as exc:
-            raise self.map_error(exc, request) from exc
-        return OpenAICompatibleStream(self, request, raw)
+        return OpenAICompatibleStream(self, request, await self._invoke(request))
 
     async def aclose(self) -> None:
         # 关闭 openai 客户端会同时关闭底层 httpx2 连接池
-        await self._client.close()
+        if self._client is not None:
+            await self._client.close()
 
     # ------------------------------------------------------------------------------
     # 异常映射
@@ -477,6 +573,27 @@ class OpenAICompatibleAdapter(BaseProviderAdapter):
             request_id=getattr(exc, "request_id", None),
         )
 
+    @staticmethod
+    def _original_error(exc: BaseException) -> BaseException:
+        """沿异常链找回被 LiteLLM 重新包装之前的原始厂商 / 传输层异常。
+
+        LiteLLM 的包装会丢失信息：连接失败变成 ``InternalServerError(500)``，
+        部分状态码的错误体（业务错误码所在位置）被丢弃。原始异常仍保留在
+        ``__context__`` 链上，找到后即可沿用与直连时完全一致的分类规则。
+        找不到时（LiteLLM 自身抛出的错误、非 OpenAI 路由）返回 ``exc`` 本身。
+        """
+        if not type(exc).__module__.startswith("litellm"):
+            return exc
+        seen: set[int] = set()
+        cur: BaseException | None = exc
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            wrapped = type(cur).__module__.startswith("litellm")
+            if not wrapped and isinstance(cur, openai.OpenAIError | httpx2.TransportError):
+                return cur
+            cur = cur.__cause__ or cur.__context__
+        return exc
+
     def classify_error(self, info: _ErrorInfo) -> ErrorRule | None:
         """钩子：Provider 业务错误码分类。返回 None 表示使用通用规则。"""
         return None
@@ -490,6 +607,38 @@ class OpenAICompatibleAdapter(BaseProviderAdapter):
         if isinstance(exc, errors.ProviderError):
             return exc
         base: dict[str, Any] = {"provider": self.name, "model": request.model}
+        wrapper, exc = exc, self._original_error(exc)
+        if exc is wrapper and type(exc).__module__.startswith("litellm"):
+            # 没有原始厂商异常可用：按 LiteLLM 自己的异常类别处理
+            name = type(exc).__name__
+            if name == "MidStreamFallbackError":
+                # 流在产生输出后中断（例如上游没有发 finish_reason 就断开）
+                return errors.ProviderServerError(
+                    f"{self.name} stream was interrupted",
+                    error_code="stream_error",
+                    retryable=False,
+                    **base,
+                )
+            if name == "UnsupportedParamsError":
+                # LiteLLM 在发请求之前，依据自带的模型能力表拒绝了某个参数
+                return errors.UnsupportedCapabilityError(
+                    f"a request parameter is not supported by {self.name}/{request.model} "
+                    "(rejected by LiteLLM before any request was sent)",
+                    **base,
+                )
+            if name == "ContextWindowExceededError":
+                return errors.ContextLengthExceededError(
+                    f"{self.name} rejected the request: context length exceeded",
+                    status_code=getattr(exc, "status_code", None),
+                    **base,
+                )
+            if name == "ContentPolicyViolationError":
+                return errors.InvalidRequestError(
+                    f"{self.name} rejected the request: content filtered",
+                    error_code="content_filtered",
+                    status_code=getattr(exc, "status_code", None),
+                    **base,
+                )
 
         # 1. 传输层：超时必须先于连接错误判断（APITimeoutError 是 APIConnectionError 的子类）
         if isinstance(exc, openai.APITimeoutError | httpx2.TimeoutException):
@@ -556,7 +705,7 @@ class OpenAICompatibleAdapter(BaseProviderAdapter):
 
 
 class OpenAICompatibleStream:
-    """把 OpenAI 风格的 ``chat.completion.chunk`` SSE 流转换为 SDK 统一事件。
+    """把 LiteLLM 输出的 OpenAI 风格 ``chat.completion.chunk`` 流转换为 SDK 统一事件。
 
     一个 chunk 可能产生多个事件（例如同时含 reasoning 和 content），
     因此用 ``_pending`` 队列缓冲，``__anext__`` 每次只取出一个。
@@ -566,13 +715,13 @@ class OpenAICompatibleStream:
     def __init__(self, adapter: OpenAICompatibleAdapter, request: ChatRequest, raw: Any) -> None:
         self._adapter = adapter
         self._request = request
-        self._raw = raw  # openai.AsyncStream
+        self._raw = raw  # litellm CustomStreamWrapper
         self._pending: deque[StreamEvent] = deque()  # 待发出的事件
         self._tools: dict[int, _ToolCallBuilder] = {}  # 按 index 拼装中的工具调用
         self._text: list[str] = []  # 聚合文本，用于最终 ChatResponse
         self._reasoning: list[str] = []  # 聚合推理内容
-        self._usage: TokenUsage | None = None
-        self._finish_raw: str | None = None
+        self._finish_raw: str | None = None  # Provider 原始 finish_reason
+        self._finish_mapped: str | None = None  # LiteLLM 映射后的 finish_reason
         self._response_id: str | None = None
         self._response_model: str | None = None
         self._extensions: dict[str, Any] = {}
@@ -602,6 +751,11 @@ class OpenAICompatibleStream:
             except errors.ProviderError:
                 raise
             except Exception as exc:
+                if _is_truncation(exc):
+                    # 响应体在没有 finish_reason / [DONE] 的情况下结束：LiteLLM 视为错误，
+                    # 本 SDK 的约定是正常收尾并把 finish_reason 记为 unknown
+                    self._exhausted = True
+                    continue
                 raise self._adapter.map_error(exc, self._request) from exc
             self._handle_chunk(chunk)
         event = self._pending.popleft()
@@ -615,30 +769,24 @@ class OpenAICompatibleStream:
             return
         self._closed = True
         self._done = True
-        close = getattr(self._raw, "close", None)
-        if close is not None:
-            await close()
+        # CustomStreamWrapper.aclose() 会关闭底层的 openai 流并释放连接
+        aclose = getattr(self._raw, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     # -- chunk 处理 ---------------------------------------------------------------------
     def _handle_chunk(self, chunk: Any) -> None:
         if self._response_id is None:
             self._response_id = getattr(chunk, "id", None)
-        if getattr(chunk, "model", None):
-            self._response_model = chunk.model
+        # LiteLLM 会把 chunk.model 改写为请求的模型 ID，Provider 实际返回的模型在隐藏元数据中
+        model = _hidden(chunk, "provider_response_model") or getattr(chunk, "model", None)
+        if model:
+            self._response_model = model
         self._extensions.update(self._adapter.provider_extensions(chunk))
-        # 顶层 usage：DeepSeek / Qwen / Kimi(新) 在最后一个 choices 为空的 chunk 中返回，
-        # GLM 在 chunk 顶层返回；后到的值覆盖先到的值
-        usage = self._adapter.parse_usage(getattr(chunk, "usage", None))
-        if usage is not None:
-            self._usage = usage
         for choice in getattr(chunk, "choices", None) or []:
             # 只处理第一个候选（n=1）
             if getattr(choice, "index", 0) not in (0, None):
                 continue
-            # Moonshot 旧版把 usage 放在最后一个 choice 内部，作为兼容兜底
-            choice_usage = self._adapter.parse_usage(_extra(choice, "usage"))
-            if choice_usage is not None:
-                self._usage = choice_usage
             delta = getattr(choice, "delta", None)
             if delta is not None:
                 # 同一个 chunk 内按 推理 → 文本 → 工具调用 的顺序产生事件
@@ -652,8 +800,10 @@ class OpenAICompatibleStream:
                 for tc in delta.tool_calls or []:
                     self._handle_tool_delta(tc)
             if choice.finish_reason:
-                # 收到 finish_reason 即结束所有工具调用；usage 可能在之后的 chunk 才到
-                self._finish_raw = choice.finish_reason
+                # 收到 finish_reason 即结束所有工具调用；usage 可能在之后的 chunk 才到。
+                # chunk 上的值已被 LiteLLM 映射过，原始值保存在流对象上
+                self._finish_mapped = choice.finish_reason
+                self._finish_raw = getattr(self._raw, "received_finish_reason", None)
                 self._end_tool_calls()
 
     def _handle_tool_delta(self, tc: Any) -> None:
@@ -707,12 +857,31 @@ class OpenAICompatibleStream:
             builder.ended = True
             self._pending.append(ToolCallEndEvent(index=index, tool_call=builder.tool_call()))
 
+    def _reported_usage(self) -> TokenUsage | None:
+        """Provider 在流中上报的 usage；没有上报时返回 None。
+
+        不能使用 LiteLLM 下发的 usage chunk：Provider 没有返回 usage 时，LiteLLM 会用
+        本地分词器估算一个并照常下发，从 chunk 本身无法区分；而请求未带
+        ``stream_options`` 时（GLM 在 chunk 顶层返回 usage），真实的 usage 又不会下发。
+        LiteLLM 把收到的原始 chunk 记录在 ``chunks`` 中，其中的 usage 才是 Provider 的
+        原始数字（DeepSeek / Qwen / Kimi 在最后一个 choices 为空的 chunk 中，GLM 在
+        chunk 顶层）；多次出现时以最后一次为准。
+        """
+        chunks = getattr(self._raw, "chunks", None)
+        if not isinstance(chunks, list):
+            return None
+        for chunk in reversed(chunks):
+            usage = self._adapter.parse_usage(getattr(chunk, "usage", None))
+            if usage is not None:
+                return usage
+        return None
+
     def _finish(self) -> None:
         """上游流结束：入队 usage 和 message_end 终态事件，并组装完整响应。"""
         # 上游未发 finish_reason 就结束时，也要补齐 tool_call_end
         self._end_tool_calls()
         # Provider 未返回 usage 时标记为 unknown，绝不伪造
-        usage = self._usage or TokenUsage.unknown()
+        usage = self._reported_usage() or TokenUsage.unknown()
         tool_calls = [self._tools[i].tool_call() for i in sorted(self._tools)] or None
         text = "".join(self._text)
         message = Message(
@@ -721,7 +890,7 @@ class OpenAICompatibleStream:
             tool_calls=tool_calls,
             reasoning_content="".join(self._reasoning) or None,
         )
-        finish = self._adapter.normalize_finish_reason(self._finish_raw)
+        finish = self._adapter.resolve_finish_reason(self._finish_raw, self._finish_mapped)
         response = ChatResponse(
             id=self._response_id,
             request_id=self._request.context.request_id,
@@ -730,7 +899,7 @@ class OpenAICompatibleStream:
             response_model=self._response_model,
             message=message,
             finish_reason=finish,
-            raw_finish_reason=self._finish_raw,
+            raw_finish_reason=self._finish_raw or self._finish_mapped,
             usage=usage,
             provider_extensions=self._extensions,
         )

@@ -10,7 +10,8 @@
   ``send_reasoning_content=True``。
 * ``tool_choice`` 支持 ``auto`` / ``none`` / ``required`` / 指定函数。
 * 流式 Usage 需要 ``stream_options.include_usage``；最后一个 chunk 的 ``choices``
-  为空并在顶层携带 ``usage``（旧版模型放在 ``choices[0].usage`` 中，仍兼容解析）。
+  为空并在顶层携带 ``usage``。旧版模型放在 ``choices[0].usage`` 中的格式在经由 LiteLLM
+  调用后不再解析（LiteLLM 会丢弃该字段），此时 Usage 记为 ``unknown``。
 * 错误体：``error.message``，以及可选的 ``type`` / ``code``。
 """
 

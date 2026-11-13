@@ -28,3 +28,14 @@ base_url = "http://vllm.internal:8000/v1"
 api_key_env = "INTERNAL_VLLM_KEY"
 otel_provider_name = "vllm"
 stream_usage_option = true
+
+# 经由 LiteLLM 原生路由接入非 OpenAI 协议的 Provider（HTTP 由 LiteLLM 发出）
+[providers.claude]
+adapter = "litellm"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+otel_provider_name = "anthropic"
+adapter_options = { litellm_provider = "anthropic" }
+[providers.claude.default_capabilities]
+reasoning = true
+vision = true

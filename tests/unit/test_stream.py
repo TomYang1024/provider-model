@@ -119,13 +119,14 @@ async def test_stream_tool_calls_interleaved(harness: Harness) -> None:
     assert final.message.content is None
 
 
-async def test_stream_reasoning_and_kimi_choice_usage(harness: Harness) -> None:
+async def test_stream_reasoning_and_kimi_usage(harness: Harness) -> None:
     harness.mock.sse(
         [
             chunk({"role": "assistant", "reasoning_content": "思考"}),
             chunk({"reasoning_content": "中"}),
             chunk({"content": "答案"}),
-            chunk({}, finish_reason="stop", choice_usage=USAGE),
+            chunk({}, finish_reason="stop"),
+            chunk(no_choices=True, usage=USAGE),
         ]
     )
     async with harness.sdk.open_stream(
@@ -142,8 +143,21 @@ async def test_stream_reasoning_and_kimi_choice_usage(harness: Harness) -> None:
     ]
     assert events[-1].response.reasoning == "思考中"
     assert events[-2].usage.output_tokens == 3
-    # 按文档请求流式 Usage；旧版放在 choices[0].usage 中的格式仍能解析
+    # 按文档请求流式 Usage：最后一个 choices 为空的 chunk 在顶层携带 usage
     assert harness.mock.body()["stream_options"] == {"include_usage": True}
+
+
+async def test_stream_legacy_choice_level_usage_is_unknown_not_estimated(harness: Harness) -> None:
+    # Moonshot 旧版把 usage 放在 choices[0].usage 中，LiteLLM 解析 chunk 时会丢弃该字段，
+    # 随后用本地分词器估算一个 usage。SDK 必须报告 unknown，而不是把估算值当作上报值。
+    harness.mock.sse(
+        [chunk({"content": "答案"}), chunk({}, finish_reason="stop", choice_usage=USAGE)]
+    )
+    resp = await harness.sdk.stream(
+        provider="kimi", model="kimi-k3", messages=[Message.user("x")]
+    ).collect()
+    assert resp.usage.source == "unknown"
+    assert resp.usage.input_tokens is None
 
 
 async def test_stream_without_usage_reports_unknown(harness: Harness) -> None:

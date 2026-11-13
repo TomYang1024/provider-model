@@ -9,6 +9,7 @@ from .adapters import (
     DeepSeekAdapter,
     GLMAdapter,
     KimiAdapter,
+    LiteLLMAdapter,
     OpenAICompatibleAdapter,
     QwenAdapter,
 )
@@ -75,6 +76,7 @@ __all__ = [
     "ImagePart",
     "InvalidRequestError",
     "KimiAdapter",
+    "LiteLLMAdapter",
     "LoggingConfig",
     "Message",
     "MessageEndEvent",
